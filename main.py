@@ -92,20 +92,18 @@ def grounded_answer(payload: QARequest):
     if not present_keywords:
         return FALLBACK_RESPONSE
 
-    # Guard against false positives: if the question clearly names a specific
-    # entity (proper noun / capitalized term) but that entity never appears in
-    # ANY chunk, the topic simply isn't covered -- don't let incidental overlap
-    # on generic words (e.g. "released", "database") make this look answerable.
+    # Guard 1: a named entity in the question must actually appear somewhere
+    # in the chunks -- an incidental shared generic word isn't enough.
     if boost_words and not any(bw in present_keywords for bw in boost_words):
         return FALLBACK_RESPONSE
 
-    # If there's no clear named entity to anchor on, require that a solid
-    # majority of the question's keywords actually appear somewhere in the
-    # chunks -- a single incidental shared word shouldn't be enough.
-    if not boost_words:
-        coverage = len(present_keywords) / len(q_keywords)
-        if coverage < 0.5:
-            return FALLBACK_RESPONSE
+    # Guard 2: naming the right entity isn't sufficient on its own -- the
+    # chunks must also cover a reasonable share of the OTHER terms in the
+    # question (the actual attribute/fact being asked about), otherwise the
+    # entity might be mentioned without the requested detail being present.
+    coverage = len(present_keywords) / len(q_keywords)
+    if coverage < 0.4:
+        return FALLBACK_RESPONSE
 
     def weight(kw):
         idf = math.log((n + 1) / (df[kw] + 1)) + 1
@@ -126,7 +124,7 @@ def grounded_answer(payload: QARequest):
     top_score = ranked[0][1]
     best_ratio = top_score / total_idf
 
-    ANSWER_THRESHOLD = 0.35
+    ANSWER_THRESHOLD = 0.4
     if best_ratio < ANSWER_THRESHOLD:
         return {
             "answer": "I don't know",
@@ -137,8 +135,6 @@ def grounded_answer(payload: QARequest):
 
     top_chunk_id = ranked[0][0]
 
-    # Final safety check: the entity must appear in the specific chunk we're
-    # about to cite, not just somewhere among all chunks.
     if boost_words and not any(bw in chunk_tokens[top_chunk_id] for bw in boost_words):
         return FALLBACK_RESPONSE
 
