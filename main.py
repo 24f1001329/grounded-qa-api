@@ -45,23 +45,17 @@ def tokenize(text: str):
     return [w for w in re.findall(r"[a-zA-Z0-9']+", text.lower()) if w not in STOPWORDS and len(w) > 1]
 
 def extract_boost_words(question: str):
-    """Words that look like named entities / proper nouns (e.g. FAISS, Qdrant)
-    get extra weight, since they usually carry the real subject of the question."""
     raw_words = re.findall(r"[A-Za-z0-9']+", question)
     boost = set()
     for i, w in enumerate(raw_words):
         if i == 0:
-            continue  # skip first word, often capitalized just for sentence-start
+            continue
         lw = w.lower()
         if lw in STOPWORDS or len(w) <= 1:
             continue
         if w.isupper() or (w[0].isupper() and not w.islower()):
             boost.add(lw)
     return boost
-
-def split_sentences(text: str):
-    parts = re.split(r'(?<=[.!?])\s+', text.strip())
-    return [p.strip() for p in parts if p.strip()]
 
 @app.exception_handler(RequestValidationError)
 async def validation_handler(request: Request, exc: RequestValidationError):
@@ -94,7 +88,6 @@ def grounded_answer(payload: QARequest):
 
     df = {kw: sum(1 for toks in chunk_tokens.values() if kw in toks) for kw in q_keywords}
 
-    # Only keywords that appear in at least one chunk count toward scoring/normalization.
     present_keywords = [kw for kw in q_keywords if df[kw] > 0]
     if not present_keywords:
         return FALLBACK_RESPONSE
@@ -131,20 +124,10 @@ def grounded_answer(payload: QARequest):
     selected = [cid for cid, sc in ranked if sc >= top_score * MULTI_CHUNK_RATIO and sc > 0][:3]
 
     chunk_map = {c.chunk_id: c.text for c in chunks}
-    top_chunk_id = ranked[0][0]
-    top_text = chunk_map[top_chunk_id]
-
-    sentences = split_sentences(top_text)
-    if not sentences:
-        answer = top_text.strip()
-    else:
-        sent_scores = []
-        for s in sentences:
-            s_toks = set(tokenize(s))
-            sc = sum(idf[kw] for kw in present_keywords if kw in s_toks)
-            sent_scores.append((sc, s))
-        sent_scores.sort(key=lambda x: x[0], reverse=True)
-        answer = sent_scores[0][1] if sent_scores[0][0] > 0 else top_text.strip()
+    # Use the FULL text of every selected chunk so no grounded detail is ever
+    # dropped by sentence-level extraction. Order follows relevance ranking.
+    answer_parts = [chunk_map[cid].strip() for cid in selected]
+    answer = " ".join(answer_parts)
 
     confidence = round(min(0.95, 0.45 + best_ratio * 0.5), 2)
 
