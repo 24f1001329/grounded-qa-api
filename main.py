@@ -44,6 +44,21 @@ class QARequest(BaseModel):
 def tokenize(text: str):
     return [w for w in re.findall(r"[a-zA-Z0-9']+", text.lower()) if w not in STOPWORDS and len(w) > 1]
 
+def extract_boost_words(question: str):
+    """Words that look like named entities / proper nouns (e.g. FAISS, Qdrant)
+    get extra weight, since they usually carry the real subject of the question."""
+    raw_words = re.findall(r"[A-Za-z0-9']+", question)
+    boost = set()
+    for i, w in enumerate(raw_words):
+        if i == 0:
+            continue  # skip first word, often capitalized just for sentence-start
+        lw = w.lower()
+        if lw in STOPWORDS or len(w) <= 1:
+            continue
+        if w.isupper() or (w[0].isupper() and not w.islower()):
+            boost.add(lw)
+    return boost
+
 def split_sentences(text: str):
     parts = re.split(r'(?<=[.!?])\s+', text.strip())
     return [p.strip() for p in parts if p.strip()]
@@ -72,20 +87,29 @@ def grounded_answer(payload: QARequest):
     if not q_keywords:
         return FALLBACK_RESPONSE
 
+    boost_words = extract_boost_words(question)
+
     n = len(chunks)
     chunk_tokens = {c.chunk_id: set(tokenize(c.text)) for c in chunks}
 
-    df = {}
-    for kw in q_keywords:
-        df[kw] = sum(1 for toks in chunk_tokens.values() if kw in toks)
+    df = {kw: sum(1 for toks in chunk_tokens.values() if kw in toks) for kw in q_keywords}
 
-    idf = {kw: math.log((n + 1) / (df[kw] + 1)) + 1 for kw in q_keywords}
+    # Only keywords that appear in at least one chunk count toward scoring/normalization.
+    present_keywords = [kw for kw in q_keywords if df[kw] > 0]
+    if not present_keywords:
+        return FALLBACK_RESPONSE
+
+    def weight(kw):
+        idf = math.log((n + 1) / (df[kw] + 1)) + 1
+        return idf * (1.8 if kw in boost_words else 1.0)
+
+    idf = {kw: weight(kw) for kw in present_keywords}
     total_idf = sum(idf.values())
 
     scores = {}
     for c in chunks:
         toks = chunk_tokens[c.chunk_id]
-        scores[c.chunk_id] = sum(idf[kw] for kw in q_keywords if kw in toks)
+        scores[c.chunk_id] = sum(idf[kw] for kw in present_keywords if kw in toks)
 
     if total_idf == 0 or max(scores.values()) == 0:
         return FALLBACK_RESPONSE
@@ -117,7 +141,7 @@ def grounded_answer(payload: QARequest):
         sent_scores = []
         for s in sentences:
             s_toks = set(tokenize(s))
-            sc = sum(idf[kw] for kw in q_keywords if kw in s_toks)
+            sc = sum(idf[kw] for kw in present_keywords if kw in s_toks)
             sent_scores.append((sc, s))
         sent_scores.sort(key=lambda x: x[0], reverse=True)
         answer = sent_scores[0][1] if sent_scores[0][0] > 0 else top_text.strip()
