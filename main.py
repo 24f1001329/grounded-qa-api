@@ -81,7 +81,7 @@ def grounded_answer(payload: QARequest):
     if not q_keywords:
         return FALLBACK_RESPONSE
 
-    boost_words = extract_boost_words(question)
+    boost_words = extract_boost_words(question) & q_keywords
 
     n = len(chunks)
     chunk_tokens = {c.chunk_id: set(tokenize(c.text)) for c in chunks}
@@ -91,6 +91,21 @@ def grounded_answer(payload: QARequest):
     present_keywords = [kw for kw in q_keywords if df[kw] > 0]
     if not present_keywords:
         return FALLBACK_RESPONSE
+
+    # Guard against false positives: if the question clearly names a specific
+    # entity (proper noun / capitalized term) but that entity never appears in
+    # ANY chunk, the topic simply isn't covered -- don't let incidental overlap
+    # on generic words (e.g. "released", "database") make this look answerable.
+    if boost_words and not any(bw in present_keywords for bw in boost_words):
+        return FALLBACK_RESPONSE
+
+    # If there's no clear named entity to anchor on, require that a solid
+    # majority of the question's keywords actually appear somewhere in the
+    # chunks -- a single incidental shared word shouldn't be enough.
+    if not boost_words:
+        coverage = len(present_keywords) / len(q_keywords)
+        if coverage < 0.5:
+            return FALLBACK_RESPONSE
 
     def weight(kw):
         idf = math.log((n + 1) / (df[kw] + 1)) + 1
@@ -120,12 +135,17 @@ def grounded_answer(payload: QARequest):
             "answerable": False
         }
 
+    top_chunk_id = ranked[0][0]
+
+    # Final safety check: the entity must appear in the specific chunk we're
+    # about to cite, not just somewhere among all chunks.
+    if boost_words and not any(bw in chunk_tokens[top_chunk_id] for bw in boost_words):
+        return FALLBACK_RESPONSE
+
     MULTI_CHUNK_RATIO = 0.6
     selected = [cid for cid, sc in ranked if sc >= top_score * MULTI_CHUNK_RATIO and sc > 0][:3]
 
     chunk_map = {c.chunk_id: c.text for c in chunks}
-    # Use the FULL text of every selected chunk so no grounded detail is ever
-    # dropped by sentence-level extraction. Order follows relevance ranking.
     answer_parts = [chunk_map[cid].strip() for cid in selected]
     answer = " ".join(answer_parts)
 
